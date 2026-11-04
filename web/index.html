@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EchoSight — Webcam Inspection Client</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: -apple-system, system-ui, sans-serif; margin: 0 auto; max-width: 720px; padding: 24px; }
+    h1 { font-size: 1.4rem; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+    video { width: 100%; max-height: 420px; background: #000; border-radius: 12px; }
+    input[type="text"], input[type="url"], input[type="password"] { flex: 1; min-width: 200px; padding: 8px; font-size: 1rem; }
+    button { padding: 8px 14px; font-size: 1rem; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: default; }
+    #guidance { border: 1px solid #888; border-radius: 8px; padding: 12px; min-height: 3em; white-space: pre-wrap; }
+    #status { font-size: 0.9rem; opacity: 0.8; }
+    label { display: flex; align-items: center; gap: 6px; }
+  </style>
+</head>
+<body>
+  <h1>EchoSight — Webcam Inspection Client</h1>
+  <p>Fast browser testing for the <code>POST /assist</code> backend. Captures a webcam frame, sends it with your query, then speaks the guidance aloud.</p>
+
+  <div class="row">
+    <input id="backendUrl" type="url" value="http://localhost:8000/assist" aria-label="Backend assist URL" />
+  </div>
+  <div class="row">
+    <input id="apiKey" type="password" placeholder="API key (only if the backend sets ASSIST_API_KEY)" aria-label="API key" autocomplete="off" />
+  </div>
+  <video id="preview" autoplay playsinline muted></video>
+  <canvas id="capture" style="display:none;"></canvas>
+
+  <div class="row">
+    <button id="startBtn">Start Camera</button>
+    <button id="askBtn" disabled>Capture &amp; Ask</button>
+    <button id="stopBtn" disabled>Stop</button>
+  </div>
+
+  <div class="row">
+    <input id="query" type="text" value="What is in front of me? Any hazards?" aria-label="Question" />
+    <button id="micBtn" title="Dictate query with Web Speech recognition">🎤 Dictate</button>
+  </div>
+
+  <div class="row">
+    <label><input id="speakToggle" type="checkbox" checked /> Speak guidance aloud</label>
+    <label><input id="partialToggle" type="checkbox" checked /> Show interim transcript</label>
+  </div>
+
+  <h2>Spoken guidance</h2>
+  <div id="guidance">(no response yet)</div>
+  <p id="status">Idle.</p>
+
+  <script>
+    const video = document.getElementById('preview');
+    const canvas = document.getElementById('capture');
+    const startBtn = document.getElementById('startBtn');
+    const askBtn = document.getElementById('askBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const micBtn = document.getElementById('micBtn');
+    const queryInput = document.getElementById('query');
+    const backendInput = document.getElementById('backendUrl');
+    const apiKeyInput = document.getElementById('apiKey');
+    const guidanceEl = document.getElementById('guidance');
+    const statusEl = document.getElementById('status');
+    const speakToggle = document.getElementById('speakToggle');
+    const partialToggle = document.getElementById('partialToggle');
+    let stream = null;
+
+    function setStatus(msg) { statusEl.textContent = msg; }
+
+    function speak(text) {
+      if (!speakToggle.checked || !('speechSynthesis' in window)) return;
+      window.speechSynthesis.cancel();
+      const utter = new SpeechSynthesisUtterance(text);
+      utter.rate = 1.05;
+      window.speechSynthesis.speak(utter);
+    }
+
+    startBtn.addEventListener('click', async () => {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+        video.srcObject = stream;
+        askBtn.disabled = false;
+        stopBtn.disabled = false;
+        startBtn.disabled = true;
+        setStatus('Camera running.');
+      } catch (err) {
+        setStatus('Camera error: ' + err.message);
+      }
+    });
+
+    stopBtn.addEventListener('click', () => {
+      if (stream) stream.getTracks().forEach(t => t.stop());
+      stream = null;
+      video.srcObject = null;
+      askBtn.disabled = true;
+      stopBtn.disabled = true;
+      startBtn.disabled = false;
+      setStatus('Camera stopped.');
+    });
+
+    // Web Speech API recognition for hands-free queries (mirrors on-glasses transcription UX).
+    micBtn.addEventListener('click', () => {
+      const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!Rec) { setStatus('Speech recognition not supported in this browser.'); return; }
+      const rec = new Rec();
+      rec.lang = 'en-US';
+      rec.interimResults = true;
+      rec.maxAlternatives = 1;
+      setStatus('Listening… speak now.');
+      rec.onresult = (event) => {
+        let interim = '', fin = '';
+        for (const res of event.results) {
+          if (res.isFinal) fin += res[0].transcript;
+          else interim += res[0].transcript;
+        }
+        // Treat final transcripts as committed input; interim text is preview only.
+        if (fin) queryInput.value = fin.trim();
+        else if (partialToggle.checked && interim) queryInput.value = interim.trim();
+      };
+      rec.onerror = (event) => setStatus('Recognition error: ' + event.error);
+      rec.onend = () => setStatus('Dictation finished.');
+      rec.start();
+    });
+
+    askBtn.addEventListener('click', async () => {
+      if (!stream) { setStatus('Start the camera first.'); return; }
+      const w = video.videoWidth || 640;
+      const h = video.videoHeight || 480;
+      canvas.width = w;
+      canvas.height = h;
+      canvas.getContext('2d').drawImage(video, 0, 0, w, h);
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.85));
+      if (!blob) { setStatus('Frame capture failed.'); return; }
+
+      const form = new FormData();
+      form.append('query', queryInput.value || 'What is in front of me?');
+      form.append('image', blob, 'frame.jpg');
+
+      setStatus('Sending frame to backend…');
+      guidanceEl.textContent = '(waiting…)';
+      try {
+        const headers = {};
+        const key = apiKeyInput.value.trim();
+        if (key) headers['Authorization'] = 'Bearer ' + key;
+        const resp = await fetch(backendInput.value, { method: 'POST', headers, body: form });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          const detail = data.detail || resp.statusText;
+          guidanceEl.textContent = 'Error: ' + detail;
+          setStatus('Backend error: ' + detail);
+          return;
+        }
+        const text = data.spoken_guidance || '(empty response)';
+        guidanceEl.textContent = text;
+        setStatus('Guidance received.');
+        speak(text);
+      } catch (err) {
+        guidanceEl.textContent = 'Request failed: ' + err.message;
+        setStatus('Request failed. Is the backend running?');
+      }
+    });
+  </script>
+</body>
+</html>
